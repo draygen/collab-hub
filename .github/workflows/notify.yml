@@ -1,0 +1,49 @@
+name: Activity Notifier
+on:
+  watch:
+    types: [started]
+  fork:
+  issues:
+    types: [opened]
+  pull_request:
+    types: [opened]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Push notification via ntfy.sh
+        run: |
+          EVENT="${{ github.event_name }}"
+          ACTOR="${{ github.actor }}"
+          REPO="${{ github.repository }}"
+
+          if [ "$EVENT" = "watch" ]; then
+            MSG="⭐ $ACTOR just starred collab-hub!"
+            TITLE="New Star"
+            TAGS="star,tada"
+            PRIORITY="high"
+          elif [ "$EVENT" = "fork" ]; then
+            MSG="🍴 $ACTOR forked collab-hub!"
+            TITLE="New Fork"
+            TAGS="fork,rocket"
+            PRIORITY="high"
+          elif [ "$EVENT" = "issues" ]; then
+            MSG="🐛 New issue from $ACTOR: ${{ github.event.issue.title }}"
+            TITLE="New Issue"
+            TAGS="bug"
+            PRIORITY="default"
+          elif [ "$EVENT" = "pull_request" ]; then
+            MSG="🔀 PR from $ACTOR: ${{ github.event.pull_request.title }}"
+            TITLE="New Pull Request"
+            TAGS="merged,tada"
+            PRIORITY="high"
+          fi
+
+          curl -s \
+            -H "Title: $TITLE" \
+            -H "Tags: $TAGS" \
+            -H "Priority: $PRIORITY" \
+            -H "Click: https://github.com/$REPO" \
+            -d "$MSG" \
+            ntfy.sh/draygen-collab-hub-alerts
