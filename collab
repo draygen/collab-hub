@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# collab — CLI for the Claude agent collaboration hub
+SERVER="${COLLAB_SERVER:-http://localhost:7777}"
+AGENT="${COLLAB_AGENT:-local}"
+[[ "$AGENT" == "local" ]] && OTHER="remote" || OTHER="local"
+
+_curl() { curl -sf -H "Content-Type: application/json" "$@"; }
+_ok()  { echo -e "\033[32m✓\033[0m $*"; }
+_err() { echo -e "\033[31m✗\033[0m $*" >&2; }
+_bold(){ echo -e "\033[1m$*\033[0m"; }
+
+cmd_help() {
+cat <<EOF
+$(_bold "collab") — Claude agent collaboration hub  (you are: $AGENT)
+
+  collab send <msg>           Send message to $OTHER
+  collab recv                 Read + clear your inbox
+  collab peek                 Read without clearing
+  collab watch                Live SSE stream of incoming messages
+
+  collab task add <desc>      Create task for $OTHER
+  collab task list [status]   List tasks (pending|in_progress|done)
+  collab task take <id>       Claim a task
+  collab task done <id>       Mark task complete
+  collab task drop <id>       Return task to pending
+
+  collab ctx show             Show shared context
+  collab ctx set <text>       Replace shared context
+  collab ctx add <text>       Append to shared context
+
+  collab status               Server health + live connections
+  collab log [n]              Last n log entries (default 20)
+  collab whoami               Show identity
+
+ENV: COLLAB_AGENT=local|remote   COLLAB_SERVER=http://...
+EOF
+}
+
+cmd_whoami() { echo "  Agent: $AGENT  |  Peer: $OTHER  |  Server: $SERVER"; }
+
+cmd_status() {
+    _curl "$SERVER/status" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+lc=d.get('live_connections',{})
+pend=d.get('pending',{})
+t=d.get('tasks',{})
+print(f\"  Status : \033[32m{d['status']}\033[0m\")
+print(f\"  Time   : {d['ts']}\")
+print(f\"  Live   : local={lc.get('local',0)}  remote={lc.get('remote',0)}\")
+print(f\"  Inbox  : local={pend.get('local',0)}  remote={pend.get('remote',0)}\")
+print(f\"  Tasks  : pending={t.get('pending',0)}  in_progress={t.get('in_progress',0)}  done={t.get('done',0)}\")
+" 2>/dev/null || { echo -e "  \033[31mServer not reachable at $SERVER\033[0m"; exit 1; }
+}
+
+_jstr() { python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "$1"; }
+
+_print_msgs() {
+    echo "$1" | python3 -c "
+import json,sys
+msgs=json.load(sys.stdin).get('messages',[])
+if not msgs: print('  \033[2m(no messages)\033[0m'); sys.exit()
+for m in msgs:
+    ts=m.get('ts','')[:19]; fr=m.get('from','?'); ty=m.get('type','message'); ct=m.get('content','')
+    c='\033[36m' if ty=='message' else '\033[33m'
+    print(f'  {c}[{ts}] {fr} ({ty})\033[0m\n    {ct}')
+"
+}
+
+cmd_send() {
+    [[ -z "$*" ]] && { _err "Usage: collab send <message>"; exit 1; }
+    r=$(_curl -X POST "$SERVER/send" -d "{\"from\":\"$AGENT\",\"to\":\"$OTHER\",\"content\":$(_jstr "$*")}")
+    echo "$r" | grep -q '"ok"' && _ok "Sent to $OTHER" || _err "Failed: $r"
+}
+
+cmd_recv() {
+    d=$(_curl "$SERVER/poll/$AGENT?clear=true")
+    n=$(echo "$d" | python3 -c "import json,sys; print(json.load(sys.stdin).get('count',0))" 2>/dev/null)
+    _bold "Inbox for $AGENT ($n messages):"
+    _print_msgs "$d"
+}
+
+cmd_peek() {
+    d=$(_curl "$SERVER/poll/$AGENT?clear=false")
+    n=$(echo "$d" | python3 -c "import json,sys; print(json.load(sys.stdin).get('count',0))" 2>/dev/null)
+    _bold "Inbox for $AGENT ($n messages, uncleared):"
+    _print_msgs "$d"
+}
+
+cmd_watch() {
+    _bold "Watching live stream for $AGENT (Ctrl+C to stop)..."
+    curl -sf -N "$SERVER/stream/$AGENT" | while IFS= read -r line; do
+        [[ "$line" == data:* ]] || continue
+        echo "${line#data: }" | python3 -c "
+import json,sys
+try:
+    m=json.loads(sys.stdin.read())
+    ts=m.get('ts','')[:19]; fr=m.get('from','?'); ty=m.get('type',''); ct=m.get('content','')
+    c='\033[36m' if ty=='message' else ('\033[33m' if 'task' in ty else '\033[35m')
+    print(f'{c}[{ts}] {fr}: {ct}\033[0m')
+except: pass
+"
+    done
+}
+
+cmd_task() {
+    local sub="${1:-list}"; shift || true
+    case "$sub" in
+        add)
+            [[ -z "$*" ]] && { _err "Usage: collab task add <description>"; exit 1; }
+            r=$(_curl -X POST "$SERVER/task/create" \
+                -d "{\"from\":\"$AGENT\",\"assigned_to\":\"$OTHER\",\"description\":$(_jstr "$*")}")
+            tid=$(echo "$r" | python3 -c "import json,sys; print(json.load(sys.stdin)['task']['id'])" 2>/dev/null)
+            [[ -n "$tid" ]] && _ok "Task created: $tid" || _err "Failed: $r"
+            ;;
+        list)
+            url="$SERVER/tasks${1:+?status=$1}"
+            _curl "$url" | python3 -c "
+import json,sys
+tasks=json.load(sys.stdin).get('tasks',[])
+if not tasks: print('  \033[2m(no tasks)\033[0m'); sys.exit()
+colors={'pending':'\033[33m','in_progress':'\033[36m','done':'\033[32m'}
+for t in tasks:
+    s=t.get('status','?'); c=colors.get(s,'\033[0m'); a=t.get('assigned_to','?')
+    print(f\"  {c}[{s}]\033[0m {t['id']} →{a}  {t.get('description','')}\")
+"
+            ;;
+        take)
+            [[ -z "$1" ]] && { _err "Usage: collab task take <id>"; exit 1; }
+            r=$(_curl -X POST "$SERVER/task/update" \
+                -d "{\"id\":\"$1\",\"status\":\"in_progress\",\"claimed_by\":\"$AGENT\"}")
+            echo "$r" | grep -q '"ok"' && _ok "Task $1 claimed" || _err "$r"
+            ;;
+        done)
+            [[ -z "$1" ]] && { _err "Usage: collab task done <id>"; exit 1; }
+            r=$(_curl -X POST "$SERVER/task/update" \
+                -d "{\"id\":\"$1\",\"status\":\"done\",\"completed_by\":\"$AGENT\"}")
+            echo "$r" | grep -q '"ok"' && _ok "Task $1 done" || _err "$r"
+            ;;
+        drop)
+            [[ -z "$1" ]] && { _err "Usage: collab task drop <id>"; exit 1; }
+            r=$(_curl -X POST "$SERVER/task/update" \
+                -d "{\"id\":\"$1\",\"status\":\"pending\"}")
+            echo "$r" | grep -q '"ok"' && _ok "Task $1 returned to pending" || _err "$r"
+            ;;
+        *) _err "Unknown: $sub" ;;
+    esac
+}
+
+cmd_ctx() {
+    local sub="${1:-show}"; shift || true
+    case "$sub" in
+        show)
+            _curl "$SERVER/context" | python3 -c "
+import json,sys; c=json.load(sys.stdin).get('content',''); print(c or '\033[2m(empty)\033[0m')"
+            ;;
+        set)
+            r=$(_curl -X POST "$SERVER/context" \
+                -d "{\"from\":\"$AGENT\",\"action\":\"replace\",\"content\":$(_jstr "$*")}")
+            echo "$r" | grep -q '"ok"' && _ok "Context set" || _err "$r"
+            ;;
+        add)
+            r=$(_curl -X POST "$SERVER/context" \
+                -d "{\"from\":\"$AGENT\",\"action\":\"append\",\"content\":$(_jstr "$*")}")
+            echo "$r" | grep -q '"ok"' && _ok "Context appended" || _err "$r"
+            ;;
+        *) _err "Unknown: $sub" ;;
+    esac
+}
+
+cmd_log() {
+    _curl "$SERVER/log?n=${1:-20}" | python3 -c "
+import json,sys
+for e in json.load(sys.stdin).get('log',[]):
+    ts=e.get('ts','')[:19]; ev=e.get('event','?')
+    rest=' '.join(f'{k}={v}' for k,v in e.items() if k not in ('ts','event'))
+    print(f'  \033[2m{ts}\033[0m  \033[1m{ev}\033[0m  \033[2m{rest}\033[0m')
+"
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+    help|--help|-h) cmd_help ;;
+    status)  cmd_status ;;
+    whoami)  cmd_whoami ;;
+    send)    cmd_send "$@" ;;
+    recv)    cmd_recv ;;
+    peek)    cmd_peek ;;
+    watch)   cmd_watch ;;
+    task)    cmd_task "$@" ;;
+    ctx)     cmd_ctx "$@" ;;
+    log)     cmd_log "$@" ;;
+    *)       _err "Unknown: $cmd"; echo; cmd_help; exit 1 ;;
+esac

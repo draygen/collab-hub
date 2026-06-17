@@ -1,0 +1,7 @@
+messages/
+tasks/
+shared/
+activity.log
+*.log
+__pycache__/
+*.pyc
