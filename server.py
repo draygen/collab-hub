@@ -4,12 +4,12 @@ Collab Server — Real-time collaboration hub for Claude agents.
 REST API + Server-Sent Events. Port 7777.
 """
 import json, os, time, uuid, threading, signal, sys, queue
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
-COLLAB_DIR = Path("/projects/.collab")
+COLLAB_DIR = Path(os.environ.get("COLLAB_DIR", "/projects/.collab"))
 MSG_DIR    = COLLAB_DIR / "messages"
 TASK_DIR   = COLLAB_DIR / "tasks"
 LOG_FILE   = COLLAB_DIR / "activity.log"
@@ -228,6 +228,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(f"data: {data}\n\n".encode())
         self.wfile.flush()
 
+    def do_PATCH(self):
+        self.do_POST()
+
     def do_POST(self):
         p = urlparse(self.path)
         path = p.path.rstrip("/")
@@ -273,7 +276,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     ensure_dirs()
     log({"event": "server_start", "port": PORT})
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True
 
     def shutdown(sig, frame):
